@@ -1,0 +1,16 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+aws-iam-env/
+venv/
+.env
+
+# AWS credentials (safety net)
+*.pem
+.aws/
+credentials
+
+# OS
+.DS_Store
