@@ -725,6 +725,277 @@ class PermissionAnalyzer:
                 )
 
 
+
+    # ── S3-001 : Public S3 Buckets ──────────────────────────
+    def check_public_s3_buckets(self) -> None:
+        """
+        CIS AWS Foundations Benchmark 2.1.5, 2.1.1
+        Detect S3 buckets (and account settings) that allow public access
+        via four independent vectors:
+
+          A) Account-level Public Access Block is not fully enabled  → CRITICAL
+          B) Bucket-level Public Access Block has any flag disabled   → HIGH
+          C) Bucket ACL grants access to AllUsers or AuthenticatedUsers → CRITICAL
+          D) Bucket policy has Principal='*' with Effect=Allow        → CRITICAL
+        """
+        account_block = self.inventory.get('s3_account_block', {})
+        buckets       = self.inventory.get('s3_buckets', [])
+
+        # ── Sub-check A: account-level block ────────────────
+        # All four flags must be True for the account to be protected.
+        # If even one is False, a misconfigured bucket can go public.
+        account_flags = [
+            'BlockPublicAcls',
+            'IgnorePublicAcls',
+            'BlockPublicPolicy',
+            'RestrictPublicBuckets',
+        ]
+        disabled_flags = [f for f in account_flags if not account_block.get(f, False)]
+
+        if disabled_flags:
+            self._add_finding(
+                rule_id='S3-001-A',
+                severity=Severity.CRITICAL,
+                title='S3 account-level Public Access Block is not fully enabled',
+                description=(
+                    f"The account-level S3 Public Access Block has {len(disabled_flags)} "
+                    f"flag(s) disabled: {disabled_flags}. This means individual buckets "
+                    f"can be made public via ACL or bucket policy."
+                ),
+                remediation=(
+                    "Go to S3 → Block Public Access (account settings) and enable all "
+                    "four flags: BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy, "
+                    "RestrictPublicBuckets. This is a single click in the console."
+                ),
+                affected_resource=f"arn:aws:s3:::*  (account: {self.account_id})",
+                region='global',
+                raw_evidence={'disabled_flags': disabled_flags}
+            )
+
+        for bucket in buckets:
+            name   = bucket['Name']
+            arn    = bucket['Arn']
+            region = bucket['Region']
+
+            # ── Sub-check B: bucket-level block ─────────────
+            pab = bucket.get('PublicAccessBlock')
+            if pab is None:
+                # No block configured at all — all four flags missing
+                disabled = account_flags[:]
+            else:
+                disabled = [f for f in account_flags if not pab.get(f, False)]
+
+            if disabled:
+                self._add_finding(
+                    rule_id='S3-001-B',
+                    severity=Severity.HIGH,
+                    title=f'Bucket public access block incomplete: {name}',
+                    description=(
+                        f"Bucket '{name}' has {len(disabled)} Public Access Block "
+                        f"flag(s) not enabled: {disabled}. The bucket can be exposed "
+                        f"via ACL or bucket policy."
+                    ),
+                    remediation=(
+                        f"Go to S3 → {name} → Permissions → Block public access → "
+                        f"Edit and enable all four flags. Or enable the account-level "
+                        f"block (S3-001-A) to protect all buckets at once."
+                    ),
+                    affected_resource=arn,
+                    region=region,
+                    raw_evidence={'bucket': name, 'disabled_flags': disabled}
+                )
+
+            # ── Sub-check C: ACL grants public access ────────
+            # AllUsers  = everyone on the internet (truly public)
+            # AuthenticatedUsers = any AWS account holder (dangerously broad)
+            PUBLIC_URIS = {
+                'http://acs.amazonaws.com/groups/global/AllUsers',
+                'http://acs.amazonaws.com/groups/global/AuthenticatedUsers',
+            }
+            for grant in bucket.get('Grants', []):
+                grantee = grant.get('Grantee', {})
+                uri     = grantee.get('URI', '')
+                if uri in PUBLIC_URIS:
+                    self._add_finding(
+                        rule_id='S3-001-C',
+                        severity=Severity.CRITICAL,
+                        title=f'Bucket ACL grants public access: {name}',
+                        description=(
+                            f"Bucket '{name}' has an ACL grant giving "
+                            f"'{grant.get('Permission')}' permission to '{uri}'. "
+                            f"This makes the bucket publicly accessible without "
+                            f"any AWS credentials."
+                        ),
+                        remediation=(
+                            f"Go to S3 → {name} → Permissions → Access Control List "
+                            f"and remove all grants to AllUsers and AuthenticatedUsers. "
+                            f"Use bucket policies with specific principal ARNs instead."
+                        ),
+                        affected_resource=arn,
+                        region=region,
+                        raw_evidence={'grant': grant}
+                    )
+                    break  # one finding per bucket for ACL
+
+            # ── Sub-check D: bucket policy allows public access
+            raw_policy = bucket.get('Policy')
+            if raw_policy:
+                try:
+                    policy_doc = json.loads(raw_policy)
+                except json.JSONDecodeError:
+                    continue
+
+                statements = policy_doc.get('Statement', [])
+                if isinstance(statements, dict):
+                    statements = [statements]
+
+                for stmt in statements:
+                    if stmt.get('Effect') != 'Allow':
+                        continue
+
+                    principal = stmt.get('Principal', '')
+                    # Principal can be "*" (string) or {"AWS": "*"} or {"AWS": [...]}
+                    is_public = (
+                        principal == '*'
+                        or principal == {"AWS": "*"}
+                        or (isinstance(principal, dict) and principal.get('AWS') == '*')
+                    )
+
+                    if is_public:
+                        self._add_finding(
+                            rule_id='S3-001-D',
+                            severity=Severity.CRITICAL,
+                            title=f'Bucket policy allows public access: {name}',
+                            description=(
+                                f"Bucket '{name}' has a bucket policy with "
+                                f"Principal='*' and Effect=Allow. Any internet user "
+                                f"can access this bucket without credentials."
+                            ),
+                            remediation=(
+                                f"Review the bucket policy on S3 → {name} → Permissions "
+                                f"→ Bucket policy. Replace Principal='*' with specific "
+                                f"IAM role or account ARNs. If public access is required "
+                                f"(e.g. static website), ensure only safe actions like "
+                                f"s3:GetObject are permitted."
+                            ),
+                            affected_resource=arn,
+                            region=region,
+                            raw_evidence={
+                                'statement': stmt,
+                            }
+                        )
+                        break  # one finding per bucket for policy
+
+    # ── EC2-001 : Security Groups Open to the World ──────────
+    def check_security_groups(self) -> None:
+        """
+        CIS AWS Foundations Benchmark 5.2, 5.3
+        Flag security group inbound rules that allow unrestricted access
+        from the internet (0.0.0.0/0 or ::/0).
+
+          A) SSH (22) or RDP (3389) open to the world → CRITICAL
+          B) Any other port open to the world          → HIGH
+        """
+        ADMIN_PORTS = {22, 3389}   # SSH and RDP — direct shell access
+        OPEN_CIDRS  = {'0.0.0.0/0', '::/0'}
+
+        security_groups = self.inventory.get('security_groups', [])
+
+        for sg in security_groups:
+            sg_id   = sg['GroupId']
+            sg_name = sg['GroupName']
+            region  = sg.get('Region', 'unknown')
+            arn     = f"arn:aws:ec2:{region}:{self.account_id}:security-group/{sg_id}"
+
+            for rule in sg.get('InboundRules', []):
+                protocol   = rule.get('IpProtocol', '')
+                from_port  = rule.get('FromPort',  0)
+                to_port    = rule.get('ToPort',    0)
+
+                # Collect all open CIDRs from this rule
+                open_cidrs = []
+                for r in rule.get('IpRanges', []):
+                    if r.get('CidrIp') in OPEN_CIDRS:
+                        open_cidrs.append(r['CidrIp'])
+                for r in rule.get('Ipv6Ranges', []):
+                    if r.get('CidrIpv6') in OPEN_CIDRS:
+                        open_cidrs.append(r['CidrIpv6'])
+
+                if not open_cidrs:
+                    continue   # this rule doesn't expose to the internet
+
+                # protocol == '-1' means ALL traffic (no port restriction)
+                all_traffic = (protocol == '-1')
+
+                # Determine which admin ports this rule exposes.
+                # A rule exposes port P if: all traffic, or from_port <= P <= to_port.
+                exposed_admin = set()
+                if all_traffic:
+                    exposed_admin = ADMIN_PORTS
+                else:
+                    for p in ADMIN_PORTS:
+                        if from_port <= p <= to_port:
+                            exposed_admin.add(p)
+
+                if exposed_admin:
+                    port_names = {22: 'SSH(22)', 3389: 'RDP(3389)'}
+                    exposed_str = ', '.join(port_names[p] for p in sorted(exposed_admin))
+                    self._add_finding(
+                        rule_id='EC2-001-A',
+                        severity=Severity.CRITICAL,
+                        title=f'Security group allows {exposed_str} from internet: {sg_name}',
+                        description=(
+                            f"Security group '{sg_name}' ({sg_id}) allows inbound "
+                            f"{exposed_str} from {open_cidrs}. Direct remote access "
+                            f"protocols exposed to the internet are the leading cause "
+                            f"of ransomware and unauthorised access incidents."
+                        ),
+                        remediation=(
+                            f"In EC2 → Security Groups → {sg_id} → Inbound rules, "
+                            f"restrict the source to known IP ranges or a bastion host "
+                            f"security group. Never use 0.0.0.0/0 for SSH or RDP."
+                        ),
+                        affected_resource=arn,
+                        region=region,
+                        raw_evidence={
+                            'sg_id':      sg_id,
+                            'sg_name':    sg_name,
+                            'protocol':   protocol,
+                            'from_port':  from_port,
+                            'to_port':    to_port,
+                            'open_cidrs': open_cidrs,
+                        }
+                    )
+                else:
+                    # Not an admin port — still dangerous but lower severity
+                    port_str = 'all ports' if all_traffic else f'port(s) {from_port}-{to_port}'
+                    self._add_finding(
+                        rule_id='EC2-001-B',
+                        severity=Severity.HIGH,
+                        title=f'Security group allows {port_str} from internet: {sg_name}',
+                        description=(
+                            f"Security group '{sg_name}' ({sg_id}) allows inbound "
+                            f"access on {port_str} (protocol: {protocol}) "
+                            f"from {open_cidrs}."
+                        ),
+                        remediation=(
+                            f"In EC2 → Security Groups → {sg_id} → Inbound rules, "
+                            f"restrict the source CIDR to known IP ranges. "
+                            f"If this is a public-facing service, consider placing it "
+                            f"behind a load balancer and locking the SG to the ALB only."
+                        ),
+                        affected_resource=arn,
+                        region=region,
+                        raw_evidence={
+                            'sg_id':      sg_id,
+                            'sg_name':    sg_name,
+                            'protocol':   protocol,
+                            'from_port':  from_port,
+                            'to_port':    to_port,
+                            'open_cidrs': open_cidrs,
+                        }
+                    )
+
     # ── Public entry point ───────────────────────────────────
     def analyze_all(self) -> list[Finding]:
         """
@@ -737,6 +1008,9 @@ class PermissionAnalyzer:
         self.check_old_access_keys() # IAM-004: Old access key check > 90-days
         self.check_unused_users()   # IAM-005: Check unused users
         self.check_wildcard_permissions() # IAM-006 Wildcard permission
+        self.check_public_s3_buckets()     # S3-001
+        self.check_security_groups()       # EC2-001
+        
 
         # Sort findings: highest Severity.value first (CRITICAL=5 → top)
         self.findings.sort(key=lambda f: f.severity.value, reverse=True)
@@ -811,12 +1085,5 @@ class PermissionAnalyzer:
                     lines.append(f"  {YELLOW}Evidence   : {evidence_str}{RESET}")
                     lines.append("")
                 lines.append("-" * 70)
-                
-                if f.raw_evidence:
-                    evidence_str = json.dumps(f.raw_evidence, default=str)
-                    if len(evidence_str) > 300:
-                        evidence_str = evidence_str[:300] + "... [truncated]"
-                    lines.append(f"  Evidence   : {evidence_str}")
-                lines.append("")
 
         return "\n".join(lines)

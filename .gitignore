@@ -14,3 +14,9 @@ credentials
 
 # OS
 .DS_Store
+
+reports/report.md
+__pycache__/
+*.pyc
+.env
+aws-iam-env/
